@@ -1,5 +1,5 @@
-yfinance
-requests
-feedparser
-pydantic>=2.0
-google-genai
+yfinance>=0.2.54
+requests>=2.32.3
+feedparser>=6.0.11
+pydantic>=2.9.0
+google-genai>=1.0.0
