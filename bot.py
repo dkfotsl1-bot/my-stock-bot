@@ -4,8 +4,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Literal, Tuple
-from urllib.parse import quote_plus
+from typing import List, Dict, Any, Optional, Literal, Tuple, Set
+from urllib.parse import quote_plus, urlparse
 
 import requests
 import feedparser
@@ -33,7 +33,6 @@ DEFAULT_WATCHLIST_JSON = """
 
 # ============================================================
 # 환경변수 처리
-# GitHub Actions에서 비어 있는 Variables가 ""로 들어와도 안전하게 처리합니다.
 # ============================================================
 
 def get_env(name: str, default: str = "") -> str:
@@ -62,18 +61,34 @@ def get_env_float(name: str, default: float) -> float:
         return default
 
 
+def get_env_int(name: str, default: int) -> int:
+    value = get_env(name, str(default))
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[WARN] {name} 값이 정수가 아닙니다: {value}. 기본값 {default} 사용.")
+        return default
+
+
+def get_env_set(name: str, default_csv: str) -> Set[str]:
+    value = get_env(name, default_csv)
+    return {x.strip().lower() for x in value.split(",") if x.strip()}
+
+
 GEMINI_API_KEY = require_env("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = require_env("TELEGRAM_CHAT_ID")
 
-# 기본 모델은 수요 폭주가 잦을 수 있는 최신 모델보다 안정성을 우선합니다.
-# GitHub Variables에 GEMINI_MODEL을 넣으면 이 값을 덮어쓸 수 있습니다.
-GEMINI_MODEL = get_env("GEMINI_MODEL", "gemini-2.0-flash")
+# 무료/가벼운 호출에 맞게 기본 모델을 Flash-Lite로 둡니다.
+GEMINI_MODEL = get_env("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 WATCHLIST = json.loads(get_env("WATCHLIST_JSON", DEFAULT_WATCHLIST_JSON))
 
 ALERT_CHANGE_PCT = get_env_float("ALERT_CHANGE_PCT", 5.0)
 REALERT_STEP_PCT = get_env_float("REALERT_STEP_PCT", 2.0)
+MAX_NEWS_PER_ASSET = get_env_int("MAX_NEWS_PER_ASSET", 3)
+MAX_GEMINI_ASSETS_PER_RUN = get_env_int("MAX_GEMINI_ASSETS_PER_RUN", 1)
+ENABLE_GEMINI_MODES = get_env_set("ENABLE_GEMINI_MODES", "premarket,aftermarket")
 
 
 # ============================================================
@@ -138,27 +153,6 @@ def get_gemini_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def get_model_candidates() -> List[str]:
-    """
-    Gemini가 503 high demand를 반환할 때 다른 Flash 모델로 재시도하기 위한 목록입니다.
-    """
-    candidates: List[str] = []
-
-    configured = get_env("GEMINI_MODEL")
-    if configured:
-        candidates.append(configured)
-
-    for model in [
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-    ]:
-        if model not in candidates:
-            candidates.append(model)
-
-    return candidates
-
-
 def format_price(value: float, ticker: str = "") -> str:
     if ticker.endswith(".KS") or ticker.endswith(".KQ"):
         return f"{value:,.0f}원"
@@ -170,13 +164,11 @@ def format_price(value: float, ticker: str = "") -> str:
 def split_long_message(message: str, limit: int = 3500) -> List[str]:
     """
     텔레그램 메시지 길이 제한을 피하기 위해 긴 메시지를 안전하게 나눕니다.
-    일반 텍스트만 사용하므로 중간에 잘려도 HTML 오류가 나지 않습니다.
     """
     chunks: List[str] = []
     current = ""
 
     for line in message.splitlines():
-        # 한 줄 자체가 너무 길면 잘라서 넣습니다.
         if len(line) > limit:
             if current:
                 chunks.append(current)
@@ -238,7 +230,6 @@ def fetch_price(asset: Dict[str, str]) -> Optional[PriceSnapshot]:
             ["previous_close", "previousClose", "regular_market_previous_close"]
         )
 
-        # fast_info가 실패하면 intraday/daily 데이터로 보완합니다.
         intraday = stock.history(period="1d", interval="5m", auto_adjust=False)
         daily = stock.history(period="10d", interval="1d", auto_adjust=False)
 
@@ -275,10 +266,64 @@ def fetch_price(asset: Dict[str, str]) -> Optional[PriceSnapshot]:
 
 
 # ============================================================
-# 뉴스 수집: Google News RSS
+# 뉴스 수집
 # ============================================================
 
-def collect_news_for_asset(asset: Dict[str, str], max_items: int = 5) -> List[Dict[str, str]]:
+def extract_source_name(entry: Any) -> str:
+    try:
+        source = entry.get("source")
+        if isinstance(source, dict):
+            return str(source.get("title") or "Google News")
+        if source and hasattr(source, "title"):
+            return str(source.title)
+    except Exception:
+        pass
+    return "Google News"
+
+
+def resolve_google_news_redirect(url: str) -> str:
+    """
+    Google News RSS 링크가 news.google.com/rss/articles/... 형태로 올 때
+    최종 기사 주소를 한 번 따라가서 가져옵니다.
+    실패하면 빈 문자열을 반환해서 못생긴 Google 래퍼 링크를 숨깁니다.
+    """
+    if not url:
+        return ""
+
+    if "news.google.com/rss/articles/" not in url:
+        return url
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10,
+            allow_redirects=True,
+        )
+        final_url = str(response.url).strip()
+        final_host = urlparse(final_url).netloc.lower()
+
+        if final_url and "news.google.com" not in final_host:
+            return final_url
+
+    except Exception as e:
+        print(f"[WARN] 뉴스 링크 정리 실패: {e}")
+
+    return ""
+
+
+def collect_news_for_asset(
+    asset: Dict[str, str],
+    max_items: int = 3,
+    resolve_links: bool = False,
+) -> List[Dict[str, str]]:
     query = asset.get("query") or asset.get("name") or asset.get("ticker")
     encoded_query = quote_plus(f"{query} when:1d")
 
@@ -295,10 +340,17 @@ def collect_news_for_asset(asset: Dict[str, str], max_items: int = 5) -> List[Di
         news_items: List[Dict[str, str]] = []
 
         for entry in feed.entries[:max_items]:
+            raw_link = getattr(entry, "link", "")
+            display_link = ""
+
+            if resolve_links:
+                display_link = resolve_google_news_redirect(raw_link)
+
             news_items.append({
                 "title": getattr(entry, "title", ""),
-                "source": "Google News",
-                "link": getattr(entry, "link", ""),
+                "source": extract_source_name(entry),
+                "link": raw_link,
+                "display_link": display_link,
                 "published": getattr(entry, "published", ""),
             })
 
@@ -324,7 +376,7 @@ def fallback_analysis(snapshot: PriceSnapshot, reason: str = "") -> AssetAnalysi
     sentiment = 1 if snapshot.change_pct > 0 else -1 if snapshot.change_pct < 0 else 0
     volatility = clamp_int(round(abs(snapshot.change_pct) * 1.5), 0, 10)
 
-    short_reason = reason[:250] if reason else "Gemini 분석 응답을 처리하지 못했습니다."
+    short_reason = reason[:180] if reason else "AI 분석 대신 가격 변동 중심 요약을 제공합니다."
 
     return AssetAnalysis(
         ticker=snapshot.ticker,
@@ -332,16 +384,13 @@ def fallback_analysis(snapshot: PriceSnapshot, reason: str = "") -> AssetAnalysi
         volatility_score=volatility,
         alert_level=alert_level,
         summary=(
-            f"AI 상세 분석을 생성하지 못해 가격 변동 중심으로 요약했습니다. "
-            f"{snapshot.name}의 전일 대비 변동률은 {snapshot.change_pct:+.2f}%입니다."
+            f"{snapshot.name}의 전일 대비 변동률은 {snapshot.change_pct:+.2f}%입니다. "
+            f"AI 상세 분석이 불안정해 가격 기준 요약으로 대체했습니다."
         ),
         positive_factors=["가격 데이터는 정상적으로 수집되었습니다."],
         negative_factors=[short_reason],
-        risk_factors=[
-            "뉴스 기반 정성 분석이 제한적입니다.",
-            "단기 가격 변동성이 확대될 수 있습니다."
-        ],
-        short_term_view="추가 뉴스, 거래량, 환율, 지수 흐름을 함께 확인하는 것이 좋습니다."
+        risk_factors=["뉴스 기반 정성 분석이 제한적일 수 있습니다."],
+        short_term_view="가격, 거래량, 관련 업종 흐름을 함께 확인하는 것이 좋습니다."
     )
 
 
@@ -355,12 +404,11 @@ def normalize_analysis(analysis: AssetAnalysis, ticker: str) -> AssetAnalysis:
     if analysis.alert_level not in ["INFO", "WATCH", "ALERT"]:
         analysis.alert_level = "INFO"
 
-    # 너무 긴 문장을 줄여 텔레그램 오류 가능성을 낮춥니다.
-    analysis.summary = (analysis.summary or "")[:500]
-    analysis.short_term_view = (analysis.short_term_view or "")[:500]
-    analysis.positive_factors = [str(x)[:200] for x in (analysis.positive_factors or [])[:3]]
-    analysis.negative_factors = [str(x)[:200] for x in (analysis.negative_factors or [])[:3]]
-    analysis.risk_factors = [str(x)[:200] for x in (analysis.risk_factors or [])[:3]]
+    analysis.summary = (analysis.summary or "")[:400]
+    analysis.short_term_view = (analysis.short_term_view or "")[:300]
+    analysis.positive_factors = [str(x)[:140] for x in (analysis.positive_factors or [])[:3]]
+    analysis.negative_factors = [str(x)[:140] for x in (analysis.negative_factors or [])[:3]]
+    analysis.risk_factors = [str(x)[:140] for x in (analysis.risk_factors or [])[:3]]
 
     return analysis
 
@@ -371,25 +419,24 @@ def analyze_with_gemini(
     news_items: List[Dict[str, str]],
 ) -> AssetAnalysis:
     news_text = "\n".join(
-        f"- {item.get('title', '')[:180]}"
-        for item in news_items[:5]
+        f"- {item.get('title', '')[:160]}"
+        for item in news_items[:MAX_NEWS_PER_ASSET]
     ) or "최근 24시간 기준으로 수집된 뉴스가 없습니다."
 
     prompt = f"""
 당신은 개인 투자자를 돕는 AI 투자 리서치 보조 도구입니다.
 
-반드시 지켜야 할 규칙:
-- 직접적인 매수, 매도, 보유 지시는 하지 마세요.
-- 제공된 가격 데이터와 뉴스 제목만 사용하세요.
-- 근거가 약하면 근거가 약하다고 말하세요.
+규칙:
+- 직접적인 매수/매도 지시는 하지 마세요.
+- 제공된 가격과 뉴스 제목만 사용하세요.
 - 한국어로 짧고 명확하게 작성하세요.
-- sentiment_score는 -10부터 +10 사이의 정수입니다.
-- volatility_score는 0부터 10 사이의 정수입니다.
-- alert_level은 INFO, WATCH, ALERT 중 하나입니다.
-- 각 리스트는 최대 3개까지만 작성하세요.
-- summary와 short_term_view는 각각 2문장 이내로 작성하세요.
+- sentiment_score는 -10부터 +10 사이 정수
+- volatility_score는 0부터 10 사이 정수
+- alert_level은 INFO, WATCH, ALERT 중 하나
+- 각 리스트는 최대 3개
+- summary와 short_term_view는 각각 2문장 이내
 
-분석 대상:
+자산:
 이름: {snapshot.name}
 티커: {snapshot.ticker}
 현재가: {snapshot.current_price}
@@ -400,41 +447,37 @@ def analyze_with_gemini(
 {news_text}
 """
 
-    last_error = ""
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AssetAnalysis,
+                temperature=0.1,
+                max_output_tokens=1200,
+            ),
+        )
 
-    for model_name in get_model_candidates():
-        try:
-            print(f"[INFO] Gemini 분석 시도: {snapshot.name} / model={model_name}")
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            if isinstance(parsed, AssetAnalysis):
+                return normalize_analysis(parsed, snapshot.ticker)
+            return normalize_analysis(AssetAnalysis.model_validate(parsed), snapshot.ticker)
 
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AssetAnalysis,
-                    temperature=0.1,
-                    max_output_tokens=2500,
-                ),
-            )
+        text = getattr(response, "text", "")
+        if not text:
+            raise ValueError("Gemini 응답이 비어 있습니다.")
 
-            parsed = getattr(response, "parsed", None)
-            if parsed is not None:
-                if isinstance(parsed, AssetAnalysis):
-                    return normalize_analysis(parsed, snapshot.ticker)
-                return normalize_analysis(AssetAnalysis.model_validate(parsed), snapshot.ticker)
+        return normalize_analysis(AssetAnalysis.model_validate_json(text), snapshot.ticker)
 
-            text = getattr(response, "text", "")
-            if not text:
-                raise ValueError("Gemini 응답이 비어 있습니다.")
+    except Exception as e:
+        print(f"[WARN] Gemini 분석 실패: {snapshot.name} ({snapshot.ticker}) / {e}")
+        return fallback_analysis(snapshot, str(e))
 
-            return normalize_analysis(AssetAnalysis.model_validate_json(text), snapshot.ticker)
 
-        except Exception as e:
-            last_error = str(e)
-            print(f"[WARN] Gemini 분석 실패: {snapshot.name} ({snapshot.ticker}) / model={model_name} / {e}")
-            time.sleep(2)
-
-    return fallback_analysis(snapshot, last_error)
+def should_use_gemini(mode: str, index: int) -> bool:
+    return (mode.lower() in ENABLE_GEMINI_MODES) and (index < MAX_GEMINI_ASSETS_PER_RUN)
 
 
 # ============================================================
@@ -442,10 +485,6 @@ def analyze_with_gemini(
 # ============================================================
 
 def send_telegram_message(message: str) -> None:
-    """
-    안정성을 위해 HTML parse_mode를 사용하지 않습니다.
-    이전 400 Bad Request의 가장 흔한 원인이 HTML 파싱 오류이기 때문입니다.
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     for chunk in split_long_message(message):
@@ -466,12 +505,25 @@ def send_telegram_message(message: str) -> None:
                 f"위 response 내용을 확인하세요."
             )
 
-        time.sleep(0.5)
+        time.sleep(0.4)
 
 
 # ============================================================
-# 메시지 포맷: 일반 텍스트
+# 메시지 포맷
 # ============================================================
+
+def report_title(report_mode: str) -> str:
+    mode = report_mode.lower()
+    if mode == "premarket":
+        return "🌅 장 시작 전 브리핑"
+    if mode == "intraday":
+        return "⏱️ 장중 점검 리포트"
+    if mode == "aftermarket":
+        return "🌙 장마감 브리핑"
+    if mode == "monitor":
+        return "🚨 실시간 알림"
+    return "📊 AI 투자 브리핑"
+
 
 def format_news_lines(news_items: List[Dict[str, str]], max_items: int = 3) -> str:
     if not news_items:
@@ -480,24 +532,26 @@ def format_news_lines(news_items: List[Dict[str, str]], max_items: int = 3) -> s
     lines = []
 
     for idx, item in enumerate(news_items[:max_items], start=1):
-        title = item.get("title", "").strip()
-        link = item.get("link", "").strip()
+        title = (item.get("title", "") or "").strip()
+        source = (item.get("source", "") or "Google News").strip()
+        display_link = (item.get("display_link", "") or "").strip()
 
         if title:
-            lines.append(f"{idx}. {title[:180]}")
-        if link:
-            lines.append(f"   {link}")
+            lines.append(f"{idx}. {title[:180]}  [{source}]")
+        if display_link:
+            lines.append(f"   {display_link}")
 
     return "\n".join(lines) if lines else "최근 뉴스 없음"
 
 
-def format_daily_report(
-    items: List[Tuple[PriceSnapshot, AssetAnalysis, List[Dict[str, str]]]]
+def format_report(
+    items: List[Tuple[PriceSnapshot, AssetAnalysis, List[Dict[str, str]]]],
+    report_mode: str,
 ) -> str:
     today = now_kst().strftime("%Y-%m-%d %H:%M KST")
 
     lines = [
-        "📊 AI 투자 브리핑",
+        report_title(report_mode),
         today,
         "",
         "주의: 이 브리핑은 투자 참고용이며 매수·매도 권유가 아닙니다.",
@@ -518,7 +572,7 @@ def format_daily_report(
             f"변동성 점수: {analysis.volatility_score}/10",
             f"단계: {analysis.alert_level}",
             "",
-            "AI 요약",
+            "요약",
             analysis.summary,
             "",
             "단기 관점",
@@ -544,26 +598,15 @@ def format_alert(
 ) -> str:
     direction = "📈 상승" if snapshot.change_pct >= 0 else "📉 하락"
 
-    return f"""🚨 투자 모니터링 알림
+    return f"""🚨 변동성 알림
 
 {snapshot.name} ({snapshot.ticker})
 현재가: {format_price(snapshot.current_price, snapshot.ticker)}
 전일 종가: {format_price(snapshot.previous_close, snapshot.ticker)}
 변동률: {snapshot.change_pct:+.2f}% ({direction})
 
-AI 판단
-감성 점수: {analysis.sentiment_score}/10
-변동성 점수: {analysis.volatility_score}/10
-알림 단계: {analysis.alert_level}
-
 요약
 {analysis.summary}
-
-단기 관점
-{analysis.short_term_view}
-
-주요 리스크
-{" / ".join(analysis.risk_factors[:3]) if analysis.risk_factors else "특이 리스크 없음"}
 
 최근 뉴스
 {format_news_lines(news_items)}
@@ -577,7 +620,9 @@ AI 판단
 # ============================================================
 
 def should_send_alert(snapshot: PriceSnapshot, state: Dict[str, Any]) -> bool:
-    if abs(snapshot.change_pct) < ALERT_CHANGE_PCT:
+    asset_threshold = ALERT_CHANGE_PCT
+
+    if abs(snapshot.change_pct) < asset_threshold:
         return False
 
     today_key = now_kst().strftime("%Y-%m-%d")
@@ -611,68 +656,92 @@ def mark_alert_sent(snapshot: PriceSnapshot, state: Dict[str, Any]) -> None:
 # 실행 모드
 # ============================================================
 
-def run_daily_report_mode() -> None:
-    print("[INFO] daily report mode 시작")
-    client = get_gemini_client()
+def build_assets_for_report(mode: str) -> List[Tuple[PriceSnapshot, List[Dict[str, str]]]]:
+    assets_data: List[Tuple[PriceSnapshot, List[Dict[str, str]]]] = []
 
-    report_items: List[Tuple[PriceSnapshot, AssetAnalysis, List[Dict[str, str]]]] = []
+    resolve_links = mode.lower() in {"premarket", "aftermarket"}
 
     for asset in WATCHLIST:
         snapshot = fetch_price(asset)
         if snapshot is None:
             continue
 
-        news_items = collect_news_for_asset(asset)
-        analysis = analyze_with_gemini(client, snapshot, news_items)
-        report_items.append((snapshot, analysis, news_items))
-
-        time.sleep(1)
-
-    if report_items:
-        send_telegram_message(format_daily_report(report_items))
-        print("[INFO] daily report 전송 완료")
-    else:
-        send_telegram_message(
-            "⚠️ AI 투자 브리핑\n\n가격 데이터를 가져오지 못해 오늘 리포트를 만들지 못했습니다."
+        news_items = collect_news_for_asset(
+            asset,
+            max_items=MAX_NEWS_PER_ASSET,
+            resolve_links=resolve_links,
         )
-        print("[WARN] report_items 없음")
+
+        assets_data.append((snapshot, news_items))
+        time.sleep(0.7)
+
+    # 큰 변동 순으로 정렬해서 AI를 중요한 종목에만 씁니다.
+    assets_data.sort(key=lambda x: abs(x[0].change_pct), reverse=True)
+    return assets_data
+
+
+def run_report_mode(mode: str) -> None:
+    print(f"[INFO] {mode} report mode 시작")
+
+    assets_data = build_assets_for_report(mode)
+    if not assets_data:
+        send_telegram_message(
+            f"{report_title(mode)}\n\n가격 데이터를 가져오지 못해 리포트를 만들지 못했습니다."
+        )
+        print("[WARN] assets_data 없음")
+        return
+
+    client = None
+    if mode.lower() in ENABLE_GEMINI_MODES and MAX_GEMINI_ASSETS_PER_RUN > 0:
+        client = get_gemini_client()
+
+    report_items: List[Tuple[PriceSnapshot, AssetAnalysis, List[Dict[str, str]]]] = []
+
+    for idx, (snapshot, news_items) in enumerate(assets_data):
+        if client is not None and should_use_gemini(mode, idx):
+            analysis = analyze_with_gemini(client, snapshot, news_items)
+        else:
+            analysis = fallback_analysis(snapshot, "이 시간대 리포트는 빠른 발송을 위해 간단 요약으로 제공합니다.")
+        report_items.append((snapshot, analysis, news_items))
+        time.sleep(0.4)
+
+    send_telegram_message(format_report(report_items, mode))
+    print(f"[INFO] {mode} report 전송 완료")
 
 
 def run_monitor_mode() -> None:
     print("[INFO] monitor mode 시작")
-    client = get_gemini_client()
+    assets_data = build_assets_for_report("monitor")
     state = load_state()
     sent_count = 0
 
-    for asset in WATCHLIST:
-        snapshot = fetch_price(asset)
-        if snapshot is None:
-            continue
-
+    for snapshot, news_items in assets_data:
         if not should_send_alert(snapshot, state):
             print(f"[INFO] 알림 조건 미충족: {snapshot.name} {snapshot.change_pct:+.2f}%")
             continue
 
-        news_items = collect_news_for_asset(asset)
-        analysis = analyze_with_gemini(client, snapshot, news_items)
+        analysis = fallback_analysis(snapshot, "모니터 알림은 속도 우선으로 간단 분석만 사용합니다.")
 
         send_telegram_message(format_alert(snapshot, analysis, news_items))
         mark_alert_sent(snapshot, state)
         save_state(state)
 
         sent_count += 1
-        time.sleep(1)
+        time.sleep(0.5)
 
     print(f"[INFO] monitor mode 완료 / 발송 알림 수: {sent_count}")
 
 
 def main() -> None:
-    mode = get_env("BOT_MODE", "daily").lower()
+    mode = get_env("BOT_MODE", "premarket").lower()
 
     if mode == "monitor":
         run_monitor_mode()
+    elif mode in {"premarket", "intraday", "aftermarket", "daily"}:
+        normalized = "premarket" if mode == "daily" else mode
+        run_report_mode(normalized)
     else:
-        run_daily_report_mode()
+        run_report_mode("premarket")
 
 
 if __name__ == "__main__":
