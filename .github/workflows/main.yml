@@ -1,20 +1,21 @@
+
 name: AI Investment Assistant
 
 on:
   schedule:
-    # 장 시작 전 브리핑: 평일 08:17 KST
     - cron: "17 8 * * 1-5"
       timezone: "Asia/Seoul"
 
-    # 장중 점검: 평일 11:37, 14:37 KST
     - cron: "37 11,14 * * 1-5"
       timezone: "Asia/Seoul"
 
-    # 장마감 브리핑: 평일 16:12 KST
     - cron: "12 16 * * 1-5"
       timezone: "Asia/Seoul"
 
-    # 선택 기능: 급등락 알림이 필요하면 아래 두 줄의 주석을 해제하세요.
+    - cron: "*/5 * * * *"
+      timezone: "Asia/Seoul"
+
+    # 필요하면 급등락 알림도 켤 수 있음
     # - cron: "7,27,47 9-15 * * 1-5"
     #   timezone: "Asia/Seoul"
 
@@ -29,6 +30,7 @@ on:
           - premarket
           - intraday
           - aftermarket
+          - commands
           - monitor
 
 permissions:
@@ -36,7 +38,7 @@ permissions:
 
 concurrency:
   group: ai-investment-assistant
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -56,6 +58,8 @@ jobs:
             echo "BOT_MODE=intraday" >> $GITHUB_ENV
           elif [ "${{ github.event.schedule }}" = "12 16 * * 1-5" ]; then
             echo "BOT_MODE=aftermarket" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "*/5 * * * *" ]; then
+            echo "BOT_MODE=commands" >> $GITHUB_ENV
           else
             echo "BOT_MODE=monitor" >> $GITHUB_ENV
           fi
@@ -76,7 +80,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # 아래 Variables는 없어도 됩니다. 없으면 bot.py의 기본값을 사용합니다.
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           WATCHLIST_JSON: ${{ vars.WATCHLIST_JSON }}
           ALERT_CHANGE_PCT: ${{ vars.ALERT_CHANGE_PCT }}
@@ -84,16 +87,17 @@ jobs:
           MAX_NEWS_PER_ASSET: ${{ vars.MAX_NEWS_PER_ASSET }}
           MAX_GEMINI_ASSETS_PER_RUN: ${{ vars.MAX_GEMINI_ASSETS_PER_RUN }}
           ENABLE_GEMINI_MODES: ${{ vars.ENABLE_GEMINI_MODES }}
+          COMMANDS_ALLOWED_CHAT_IDS: ${{ vars.COMMANDS_ALLOWED_CHAT_IDS }}
         run: python bot.py
 
-      - name: Commit alert state if changed
+      - name: Commit state if changed
         run: |
-          if [ -n "$(git status --porcelain state/alerts.json)" ]; then
+          if [ -n "$(git status --porcelain state/bot_state.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add state/alerts.json
-            git commit -m "Update alert state [skip ci]"
+            git add state/bot_state.json
+            git commit -m "Update bot state [skip ci]"
             git push
           else
-            echo "No alert state changes."
+            echo "No state changes."
           fi
