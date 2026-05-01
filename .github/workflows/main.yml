@@ -1,25 +1,34 @@
-
 name: AI Investment Assistant
 
 on:
   schedule:
-    # 매일 오전 08:30 KST 실행
-    # GitHub cron은 UTC 기준이므로 08:30 KST = 전날 23:30 UTC
-    - cron: "30 23 * * *"
+    # 장 시작 전 브리핑: 평일 08:17 KST
+    - cron: "17 8 * * 1-5"
+      timezone: "Asia/Seoul"
 
-    # 평일 09:00~15:59 KST, 10분마다 모니터링
-    # 09:00~15:59 KST = 00:00~06:59 UTC
-    - cron: "*/10 0-6 * * 1-5"
+    # 장중 점검: 평일 11:37, 14:37 KST
+    - cron: "37 11,14 * * 1-5"
+      timezone: "Asia/Seoul"
+
+    # 장마감 브리핑: 평일 16:12 KST
+    - cron: "12 16 * * 1-5"
+      timezone: "Asia/Seoul"
+
+    # 선택 기능: 급등락 알림이 필요하면 아래 두 줄의 주석을 해제하세요.
+    # - cron: "7,27,47 9-15 * * 1-5"
+    #   timezone: "Asia/Seoul"
 
   workflow_dispatch:
     inputs:
       mode:
         description: "실행 모드 선택"
         required: true
-        default: "daily"
+        default: "premarket"
         type: choice
         options:
-          - daily
+          - premarket
+          - intraday
+          - aftermarket
           - monitor
 
 permissions:
@@ -41,8 +50,12 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "BOT_MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
-          elif [ "${{ github.event.schedule }}" = "30 23 * * *" ]; then
-            echo "BOT_MODE=daily" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "17 8 * * 1-5" ]; then
+            echo "BOT_MODE=premarket" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "37 11,14 * * 1-5" ]; then
+            echo "BOT_MODE=intraday" >> $GITHUB_ENV
+          elif [ "${{ github.event.schedule }}" = "12 16 * * 1-5" ]; then
+            echo "BOT_MODE=aftermarket" >> $GITHUB_ENV
           else
             echo "BOT_MODE=monitor" >> $GITHUB_ENV
           fi
@@ -68,6 +81,9 @@ jobs:
           WATCHLIST_JSON: ${{ vars.WATCHLIST_JSON }}
           ALERT_CHANGE_PCT: ${{ vars.ALERT_CHANGE_PCT }}
           REALERT_STEP_PCT: ${{ vars.REALERT_STEP_PCT }}
+          MAX_NEWS_PER_ASSET: ${{ vars.MAX_NEWS_PER_ASSET }}
+          MAX_GEMINI_ASSETS_PER_RUN: ${{ vars.MAX_GEMINI_ASSETS_PER_RUN }}
+          ENABLE_GEMINI_MODES: ${{ vars.ENABLE_GEMINI_MODES }}
         run: python bot.py
 
       - name: Commit alert state if changed
