@@ -1,0 +1,21 @@
+{
+  "favorites": [
+    {
+      "name": "Bitcoin",
+      "ticker": "BTC-USD",
+      "query": "Bitcoin BTC"
+    },
+    {
+      "name": "Samsung Electronics",
+      "ticker": "005930.KS",
+      "query": "삼성전자"
+    },
+    {
+      "name": "SK Hynix",
+      "ticker": "000660.KS",
+      "query": "SK하이닉스"
+    }
+  ],
+  "last_update_id": 46194515,
+  "alerts": {}
+}
